@@ -2096,6 +2096,90 @@ def test_mixed_precision_kv_cache_with_uniform_type_specs():
     assert scheduler_config.needs_kv_cache_zeroing
 
 
+def test_generate_scheduler_kv_cache_config_asymmetric_pp():
+    """Scheduler config must come from the LARGEST-footprint rank.
+
+    Pipeline stages can hold different layer counts (e.g. an MTP draft layer
+    on the last stage only), so per-rank kv_cache_tensors byte size varies
+    while num_blocks stays uniform. Consumers that derive a shared capacity
+    from the byte footprint (e.g. OffloadingSpec's CPU tier block count,
+    which is inversely related to it) must see the largest footprint so the
+    derived shared value is safe for every rank.
+    """
+
+    def make_config(layer_names: list[str], tensor_size: int) -> KVCacheConfig:
+        specs = {name: new_kv_cache_spec() for name in layer_names}
+        return KVCacheConfig(
+            num_blocks=10,
+            kv_cache_tensors=[
+                KVCacheTensor(size=tensor_size, shared_by=[name])
+                for name in layer_names
+            ],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    layer_names,
+                    UniformTypeKVCacheSpecs(block_size=16, kv_cache_specs=specs),
+                ),
+            ],
+        )
+
+    # PP0-like rank: 2 layers; PP1-like rank: 3 layers (extra draft layer).
+    small = make_config(["layer_1", "layer_2"], tensor_size=1024)
+    large = make_config(["layer_1", "layer_2", "layer_3"], tensor_size=1024)
+
+    for configs in ([small, large], [large, small]):
+        scheduler_config = generate_scheduler_kv_cache_config(configs)
+        # Largest-footprint rank picked regardless of input order.
+        assert len(scheduler_config.kv_cache_tensors) == 3
+        assert scheduler_config.num_blocks == 10
+
+
+def test_generate_scheduler_kv_cache_config_packed_layout():
+    """Packed layouts (block_stride set) alias one backing allocation, so the
+    footprint is tensors[0].size, NOT the sum -- mirroring OffloadingSpec."""
+    specs2 = {name: new_kv_cache_spec() for name in ["layer_1", "layer_2"]}
+    # Packed rank: two tensors aliasing one 4096-byte allocation.
+    packed = KVCacheConfig(
+        num_blocks=10,
+        kv_cache_tensors=[
+            KVCacheTensor(size=4096, shared_by=["layer_1"], block_stride=256),
+            KVCacheTensor(size=4096, shared_by=["layer_2"], block_stride=256),
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["layer_1", "layer_2"],
+                UniformTypeKVCacheSpecs(block_size=16, kv_cache_specs=specs2),
+            ),
+        ],
+    )
+    # Unpacked rank: three separate 2048-byte tensors -> summed footprint 6144
+    # exceeds the packed rank's true footprint (4096, not 8192).
+    specs3 = {name: new_kv_cache_spec() for name in ["layer_1", "layer_2", "layer_3"]}
+    unpacked = KVCacheConfig(
+        num_blocks=10,
+        kv_cache_tensors=[
+            KVCacheTensor(size=2048, shared_by=[name])
+            for name in ["layer_1", "layer_2", "layer_3"]
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["layer_1", "layer_2", "layer_3"],
+                UniformTypeKVCacheSpecs(block_size=16, kv_cache_specs=specs3),
+            ),
+        ],
+    )
+    scheduler_config = generate_scheduler_kv_cache_config([packed, unpacked])
+    # If the packed footprint were summed (8192), the packed rank would win;
+    # correct per-rank footprints are 4096 (packed) vs 6144 (unpacked).
+    assert len(scheduler_config.kv_cache_tensors) == 3
+
+
+def test_generate_scheduler_kv_cache_config_empty_list():
+    """An empty config list must fail the explicit guard, not IndexError."""
+    with pytest.raises(AssertionError):
+        generate_scheduler_kv_cache_config([])
+
+
 def new_mla_spec(cache_dtype_str=None, block_size=16):
     # head_size = kv_lora_rank(512) + qk_rope_head_dim(64) = 576
     return MLAAttentionSpec(
