@@ -1823,18 +1823,57 @@ def get_kv_cache_groups(
     return groups
 
 
+def _kv_cache_footprint_bytes(cfg: KVCacheConfig) -> int:
+    """Per-worker KV-cache byte footprint, mirroring the same is_packed logic
+    OffloadingSpec.__init__ (vllm/v1/kv_offload/cpu/spec.py) uses to derive
+    CPU-offload-tier sizing. Used by generate_scheduler_kv_cache_config to
+    pick the WORST-CASE (largest-footprint) rank's config as the scheduler's
+    representative -- see the comment there for why.
+    """
+    tensors = cfg.kv_cache_tensors
+    if not tensors:
+        return 0
+    is_packed = any(t.block_stride for t in tensors)
+    assert not is_packed or all(t.block_stride for t in tensors)
+    return tensors[0].size if is_packed else sum(t.size for t in tensors)
+
+
 def generate_scheduler_kv_cache_config(
     kv_cache_configs: list[KVCacheConfig],
 ) -> KVCacheConfig:
     """
     Generate the KV cache configuration for the scheduler.
     """
+    assert kv_cache_configs
     assert all(
         [cfg.num_blocks == kv_cache_configs[0].num_blocks for cfg in kv_cache_configs]
     )
-    # All workers have the same kv_cache_config except layer names, so use
-    # an arbitrary one to initialize the scheduler.
-    cfg = copy.deepcopy(kv_cache_configs[0])
+    # GPU-side num_blocks is uniform across ranks (asserted above), so any
+    # rank's config is safe for the GPU-side fields this function's caller
+    # derives (num_gpu_blocks, block_size, kv_cache_size_tokens, ...).
+    #
+    # But it is NOT safe to pick an arbitrary rank for consumers that derive
+    # values from cfg.kv_cache_tensors's aggregate byte size, like
+    # OffloadingSpec.__init__ (CPU-offload-tier block count). Pipeline
+    # parallelism can give different stages different numbers of layers --
+    # e.g. a spec-decode draft/MTP layer attached to only one PP stage --
+    # so kv_cache_tensors's total size legitimately varies per rank even
+    # though num_blocks does not. A smaller-footprint rank's config yields a
+    # LARGER derived CPU block count than a larger-footprint rank's; picking
+    # rank 0 arbitrarily can therefore hand the scheduler a shared logical
+    # CPU block-ID ceiling that is valid for rank 0 but out-of-bounds for a
+    # larger-footprint rank's actually-allocated CPU tensor, causing a
+    # segfault (0xffffffffffffffff) under active KV offload store traffic.
+    #
+    # Picking the LARGEST-footprint rank's config here guarantees any such
+    # downstream consumer computes the safe, conservative (smallest) value
+    # instead -- no cross-process communication needed, since every rank's
+    # config is already gathered in this single (EngineCore) process.
+    largest_idx = max(
+        range(len(kv_cache_configs)),
+        key=lambda i: _kv_cache_footprint_bytes(kv_cache_configs[i]),
+    )
+    cfg = copy.deepcopy(kv_cache_configs[largest_idx])
     for group in cfg.kv_cache_groups:
         if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
             # All layers in the UniformTypeKVCacheSpecs have the same type,
