@@ -243,10 +243,8 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts, SupportsPP):
         # PP support: the MTP draft runs only on the last PP stage (the runner gates
         # drafter construction on get_pp_group().is_last_rank), so it never actually
         # consumes PP intermediate tensors — but SupportsPP requires this factory.
-        self.make_empty_intermediate_tensors = (
-            make_empty_intermediate_tensors_factory(
-                ["hidden_states", "residual"], self.config.hidden_size
-            )
+        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
+            ["hidden_states", "residual"], self.config.hidden_size
         )
 
     def set_moe_parameters(self):
