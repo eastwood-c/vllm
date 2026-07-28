@@ -243,9 +243,7 @@ def test_packed_broadcast_roundtrip_spec_decode(width, max_sample_len):
     every field must round-trip with the original dtypes."""
     handler = FakePackedPPHandler(max_sample_len=max_sample_len)
     num_reqs, msl = 3, max_sample_len
-    sampled = torch.arange(num_reqs * width, dtype=torch.int64).reshape(
-        num_reqs, width
-    )
+    sampled = torch.arange(num_reqs * width, dtype=torch.int64).reshape(num_reqs, width)
     num_sampled = torch.tensor([1] * num_reqs, dtype=torch.int32)
     num_rejected = torch.tensor([0, 1, 2][:num_reqs], dtype=torch.int32)
     draft = torch.full((num_reqs, msl - 1), 7, dtype=torch.int64)
