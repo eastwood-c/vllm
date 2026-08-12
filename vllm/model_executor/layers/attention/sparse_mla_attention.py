@@ -526,11 +526,19 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
         # The indexer carries the shared buffer for normal layers and tests;
         # the explicitly-passed buffer covers backbone skip layers, whose
         # indexer is not constructed (see deepseek_v2.py).
-        self.topk_indices_buffer: torch.Tensor | None = (
-            indexer.topk_indices_buffer  # type: ignore[attr-defined]
-            if indexer is not None
-            else topk_indices_buffer
-        )
+        #
+        # Held as a reference to the indexer and resolved on every read (see the
+        # topk_indices_buffer property) rather than captured here. Under MTP with
+        # pipeline parallelism, _maybe_share_lm_head REPLACES
+        # Indexer.topk_indices_buffer with the target model's buffer AFTER this
+        # impl is constructed. A value captured at __init__ time is stale from
+        # that point on — it still points at the draft model's own, never-written
+        # buffer. The indexer then writes real top-k indices into the shared
+        # buffer while this impl reads the dead one, so DSA attends to garbage and
+        # the draft degenerates into repeating the current token (~27-33%
+        # acceptance instead of ~85%).
+        self._indexer = indexer
+        self._topk_indices_buffer = topk_indices_buffer
         self._use_flashinfer_concat_mla_k = (
             has_flashinfer()
             and which("ninja") is not None
@@ -546,6 +554,18 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
             v_head_dim=v_head_dim,
             kv_cache_dtype=kv_cache_dtype,
         )
+
+    @property
+    def topk_indices_buffer(self) -> torch.Tensor | None:
+        """The buffer the indexer writes top-k indices into, resolved live.
+
+        Every subclass reads this in its forward path. Going through the indexer
+        on each read is what makes the MTP+PP buffer swap visible here; see the
+        note in __init__.
+        """
+        if self._indexer is not None:
+            return self._indexer.topk_indices_buffer  # type: ignore[attr-defined]
+        return self._topk_indices_buffer
 
     @staticmethod
     def masked_mha_workspace_fits(prefill: MLACommonPrefillMetadata) -> bool:
