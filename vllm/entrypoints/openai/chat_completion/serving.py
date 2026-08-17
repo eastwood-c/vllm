@@ -167,6 +167,12 @@ class OpenAIServingChat(GenerateBaseServing):
         self.enable_force_include_usage = enable_force_include_usage
         self.enable_per_request_metrics = enable_per_request_metrics
         self.default_sampling_params = self.model_config.get_diff_sampling_param()
+        # Used to turn `reasoning_effort` into a `thinking_token_budget`, and to
+        # apply a server-side default budget. None when the engine exposes no
+        # vllm_config (e.g. some external/mocked clients), in which case
+        # per-request budgets still work and nothing else changes.
+        _vllm_config = getattr(self.engine_client, "vllm_config", None)
+        self.reasoning_config = getattr(_vllm_config, "reasoning_config", None)
         mc = self.model_config
         self.override_max_tokens = (
             self.default_sampling_params.get("max_tokens")
@@ -310,6 +316,7 @@ class OpenAIServingChat(GenerateBaseServing):
                 sampling_params = request.to_sampling_params(
                     max_tokens,
                     self.default_sampling_params,
+                    self.reasoning_config,
                 )
 
             self._log_inputs(
