@@ -9,6 +9,7 @@ from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.sequence import IntermediateTensors
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
@@ -155,6 +156,10 @@ class MultiModuleMTPSpeculator(DraftModelSpeculator):
         skip_attn_for_dummy_run: bool = False,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
+        # Accepted to match BaseSpeculator.propose(); the model runner passes
+        # this unconditionally. Unused here — this speculator drafts only on the
+        # last PP rank and does not consume the target's PP payload.
+        intermediate_tensors: IntermediateTensors | None = None,
     ) -> torch.Tensor:
         num_reqs = input_batch.num_reqs
         seq_lens_cpu_upper_bound = input_batch.seq_lens_cpu_upper_bound
