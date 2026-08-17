@@ -18,7 +18,7 @@ from pydantic import (
     model_validator,
 )
 
-from vllm.config import ModelConfig
+from vllm.config import ModelConfig, ReasoningConfig
 from vllm.entrypoints.chat_utils import (
     ChatCompletionMessageParam,
     ChatTemplateContentFormatOption,
@@ -662,6 +662,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
         self,
         max_tokens: int,
         default_sampling_params: dict,
+        reasoning_config: ReasoningConfig | None = None,
     ) -> SamplingParams:
         # Default parameters
         if (repetition_penalty := self.repetition_penalty) is None:
@@ -702,6 +703,27 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if prompt_logprobs is None and self.echo:
             prompt_logprobs = self.top_logprobs
 
+        # `reasoning_effort` otherwise only toggles `enable_thinking` in the
+        # chat template, so levels are indistinguishable unless the server
+        # configures budgets for them.
+        #
+        # Server-side policy applies only when the client did not set
+        # `thinking_token_budget` at all. Test membership in `model_fields_set`
+        # rather than checking for None: `-1` means "unlimited" and is
+        # normalised to None by validate_thinking_token_budget, so by value
+        # alone it is indistinguishable from "omitted". Treating it as omitted
+        # would let a configured default silently re-bound a request that
+        # explicitly asked for unbounded reasoning.
+        thinking_token_budget = self.thinking_token_budget
+        if (
+            reasoning_config is not None
+            and "thinking_token_budget" not in self.model_fields_set
+        ):
+            thinking_token_budget = reasoning_config.resolve_thinking_token_budget(
+                requested_budget=None,
+                reasoning_effort=self.reasoning_effort,
+            )
+
         extra_args: dict[str, Any] = self.vllm_xargs if self.vllm_xargs else {}
         if self.kv_transfer_params:
             # Pass in kv_transfer_params via extra_args
@@ -741,7 +763,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             structured_outputs=self.extract_structured_outputs(),
             logit_bias=self.logit_bias,
             bad_words=self.bad_words,
-            thinking_token_budget=self.thinking_token_budget,
+            thinking_token_budget=thinking_token_budget,
             allowed_token_ids=self.allowed_token_ids,
             extra_args=extra_args or None,
             skip_clone=True,  # Created fresh per request, safe to skip clone
