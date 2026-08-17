@@ -47,12 +47,64 @@ def test_deepseek_mtp_implements_supports_pp():
     )
 
 
-def test_deepseek_mtp_has_make_empty_intermediate_tensors():
-    """DeepSeekMTP must provide make_empty_intermediate_tensors."""
+def test_deepseek_mtp_wires_make_empty_intermediate_tensors():
+    """DeepSeekMTP.__init__ must wire up make_empty_intermediate_tensors.
+
+    SupportsPP requires the factory, and the engine calls it on the *instance*
+    (``self.model.make_empty_intermediate_tensors(...)``) when PP rank > 0.
+
+    Assert on the class's own ``__init__`` source rather than
+    ``hasattr(DeepSeekMTP, ...)``: the factory is an instance attribute, so a
+    class-level hasattr only ever passed because ``SupportsPP`` used to declare
+    ``make_empty_intermediate_tensors`` as a method stub. Upstream later changed
+    it to a bare annotation, which creates no class attribute -- so the old
+    assertion began failing while the model was still correct. Constructing
+    DeepSeekMTP needs a full VllmConfig and real weights, which does not fit a
+    CPU-only gate, so inspect the source instead.
+
+    Note: read the source off the *class* and pick ``__init__`` out of its body.
+    ``inspect.getsource(DeepSeekMTP.__init__)`` returns the wrong function --
+    ``@support_torch_compile`` replaces ``__init__`` with its own wrapper
+    (qualname ``_support_torch_compile.<locals>.__init__``, defined in
+    vllm/compilation/decorators.py), which of course never assigns the factory.
+    """
+    import ast
+    import inspect
+    import textwrap
+
     from vllm.model_executor.models.deepseek_mtp import DeepSeekMTP
 
-    assert hasattr(DeepSeekMTP, "make_empty_intermediate_tensors"), (
-        "DeepSeekMTP must provide make_empty_intermediate_tensors"
+    class_tree = ast.parse(textwrap.dedent(inspect.getsource(DeepSeekMTP)))
+    class_def = next(
+        node
+        for node in ast.walk(class_tree)
+        if isinstance(node, ast.ClassDef) and node.name == DeepSeekMTP.__name__
+    )
+    init_def = next(
+        (
+            node
+            for node in class_def.body
+            if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+        ),
+        None,
+    )
+    assert init_def is not None, "DeepSeekMTP must define its own __init__"
+
+    assigns_factory = any(
+        isinstance(node, ast.Assign)
+        and any(
+            isinstance(t, ast.Attribute)
+            and t.attr == "make_empty_intermediate_tensors"
+            and isinstance(t.value, ast.Name)
+            and t.value.id == "self"
+            for t in node.targets
+        )
+        for node in ast.walk(init_def)
+    )
+    assert assigns_factory, (
+        "DeepSeekMTP.__init__ must assign self.make_empty_intermediate_tensors; "
+        "without it the engine cannot build the MTP draft under pipeline "
+        "parallelism"
     )
 
 
